@@ -1,0 +1,24 @@
+# Multi-Agent Research Assistant Dependencies
+# INFO5940 Course Project
+
+# Core LLM Framework
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
+langchain-chroma>=0.1.0
+langchain-text-splitters>=0.2.0
+
+# OpenAI API
+openai>=1.10.0
+
+# Vector Database
+chromadb>=0.4.22
+
+# PDF Processing
+pypdf>=3.17.0
+
+# Web Interface
+streamlit>=1.30.0
+
+# Environment Configuration
+python-dotenv>=1.0.0
