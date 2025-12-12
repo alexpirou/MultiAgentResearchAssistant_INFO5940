@@ -9,6 +9,8 @@ from langchain_community.document_loaders import PyPDFLoader
 import chromadb
 from dotenv import load_dotenv
 load_dotenv()
+from tavily import TavilyClient
+
 
 # ===============================================
 # Backend configuration for chroma vectorestore, llm client, and models (llm + embeddings)
@@ -26,6 +28,31 @@ client = OpenAI(
 # Model configuration (we can change this or allow the user to select)
 LLM_MODEL = "openai.gpt-4o-mini"
 EMBEDDING_MODEL = "openai.text-embedding-3-small"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tools
+# ──────────────────────────────────────────────────────────────────────────────
+
+def internet_search(query: str) -> str:
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Search error: missing TAVILY_API_KEY."
+
+    try:
+        tavily_client = TavilyClient(api_key=api_key)
+        response = tavily_client.search(query, max_results=3)
+
+        items = response.get("results", [])
+        if not items:
+            return "No results found."
+
+        return "\n".join(
+            f"- {it.get('title', 'N/A')}: {it.get('url','')} — {it.get('content', 'N/A')}"
+            for it in items
+        )
+    except Exception as e:
+        return f"Search error: {e}"
+
 
 # ===============================================
 # System prompting for agents
@@ -115,6 +142,38 @@ Format your response with clear sections:
 
 Always base your analysis on the provided context from the papers."""
 
+
+RESEARCH_VERIFIER_PROMPT = """You are a Research Idea Verifier Agent.
+
+Input you receive will include:
+(1) Proposed research directions produced from the uploaded papers.
+(2) Web search results (snippets) for targeted queries.
+
+Your goals:
+1. For each proposed direction, assess whether it appears already explored or closely related work exists.
+2. If related work exists, explain briefly how it overlaps and how to adjust the idea to be more novel or precise.
+3. Flag claims that require citation or that the web snippets contradict.
+4. Produce a revised set of directions that are stronger, better scoped, and clearly positioned.
+
+Rules:
+- Only use evidence from the provided web snippets; do not invent paper titles, authors, or numbers.
+- If the snippets are insufficient, say “unclear from search results” and suggest a better query.
+- Keep the final output structured and actionable.
+
+Format:
+For each idea:
+- Status: Likely novel / Possibly known / Likely known / Unclear
+- Evidence: 1–2 bullets referencing the web snippets
+- Revision: improved idea + positioning
+- Next search query: (if unclear)
+
+Output constraints:
+- Verify at most 4 ideas (pick the most promising / most uncertain).
+- Max 120 words per idea.
+- Do not include extra sections beyond the required fields.
+
+"""
+
 # ===============================================
 # Session State Initialization
 # ===============================================
@@ -172,9 +231,10 @@ def get_agent_info(intent: str) -> tuple[str, str]:
         return "Reader Agent", READER_AGENT_PROMPT
     elif intent == "research":
         return "Research Advisor", RESEARCH_ADVISOR_PROMPT
-    else:  # question or default
+    elif intent == "verify":
+        return "Research Verifier", RESEARCH_VERIFIER_PROMPT
+    else:
         return "QA Agent", QA_AGENT_PROMPT
-
 # ===============================================
 # Run the selected agent with context
 # ===============================================
@@ -189,6 +249,7 @@ def run_agent(user_message: str, intent: str, context: str) -> str:
     # Build the system message with context
     if context:
         system_with_context = f"""{system_prompt}
+
 
 Here is relevant context from the uploaded research papers:
 
@@ -212,6 +273,31 @@ Note: No relevant context was retrieved. This may indicate an issue with documen
     )
     
     return stream
+
+def run_agent_nonstream(user_message: str, intent: str, context: str) -> str:
+    agent_name, system_prompt = get_agent_info(intent)
+
+    if context:
+        system_with_context = f"""{system_prompt}
+
+Context:
+
+{context}
+"""
+    else:
+        system_with_context = system_prompt
+
+    resp = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_with_context},
+            {"role": "user", "content": user_message}
+        ],
+        temperature=0.2,
+        max_tokens=900
+    )
+    return resp.choices[0].message.content or ""
+
 
 # =============================================================================
 # Process uploaded PDF files
@@ -367,7 +453,7 @@ with st.sidebar:
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Summarize", use_container_width=True, disabled=not st.session_state["current_files"]):
+        if st.button("Summary", use_container_width=True, disabled=not st.session_state["current_files"]):
             st.session_state["quick_action"] = "Summarize all the uploaded papers. Provide key findings, methodology, and contributions."
     
     with col2:
@@ -393,70 +479,132 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # Handle quick actions
-if "quick_action" in st.session_state and st.session_state["quick_action"]:
-    question = st.session_state["quick_action"]
+user_typed = st.chat_input(
+    "Ask about your research papers...",
+    disabled=not st.session_state["current_files"]
+)
+
+qa = st.session_state.get("quick_action")
+if qa:
+    question = qa
     st.session_state["quick_action"] = None
 else:
-    question = st.chat_input(
-        "Ask about your research papers...",
-        disabled=not st.session_state["current_files"]
-    )
+    question = user_typed
+
 
 # Process user input
 if question:
     # Check if documents are loaded
+    handled = False
     if not st.session_state.get("vectorstore"):
         st.error("Please upload research papers first!")
-        st.stop()
+        handled = True
+    else:
     
-    # Display user message
-    st.chat_message("user").write(question)
-    st.session_state.messages.append({"role": "user", "content": question})
-    
-    # Classify intent
-    with st.spinner("Analyzing intent..."):
-        intent = classify_intent(question)
-    
-    agent_name, _ = get_agent_info(intent)
-    
-    # Retrieve relevant context
-    context = retrieve_context(question, k=5)
-    
-    # Generate response
-    with st.chat_message("assistant"):
-        st.caption(f"{agent_name}")
+        # Display user message
+        st.chat_message("user").write(question)
+        st.session_state.messages.append({"role": "user", "content": question})
         
-        # Show source chunks in expander
-        if context:
-            with st.expander("Source Chunks Used", expanded=False):
-                chunks = context.split("\n\n---\n\n")
-                for i, chunk in enumerate(chunks, 1):
-                    st.text_area(
-                        f"Chunk {i}",
-                        chunk[:500] + "..." if len(chunk) > 500 else chunk,
-                        height=100,
-                        disabled=True,
-                        label_visibility="collapsed"
-                    )
-                    if i < len(chunks):
-                        st.divider()
+        # Classify intent
+        with st.spinner("Analyzing intent..."):
+            intent = classify_intent(question)
         
-        # Stream response
-        try:
-            stream = run_agent(question, intent, context)
-            response = st.write_stream(stream)
+        agent_name, _ = get_agent_info(intent)
+        
+        # Retrieve relevant context
+        context = retrieve_context(question, k=5)
+
+        if intent == "research":
+            # Step 1: generate research ideas (non-streaming)
+            ideas_text = run_agent_nonstream(question, intent="research", context=context)
+
+            # Show the immediate Research Advisor output
             
-            # Save to history
+
+            with st.chat_message("assistant"):
+                st.caption("Research Advisor")
+                st.markdown(ideas_text)
+
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": response,
-                "agent": f"{agent_name}"
+                "content": ideas_text,
+                "agent": "Research Advisor"
             })
-        except Exception as e:
-            error_msg = f"Error generating response: {str(e)}"
-            st.error(error_msg)
+
+            # Extract a few candidate idea lines to search (keeps searches small)
+            bullet_lines = [
+                ln.strip("-• ").strip()
+                for ln in ideas_text.splitlines()
+                if ln.strip().startswith(("-", "•"))
+            ]
+            queries = [f"{b} related work arxiv" for b in bullet_lines[:3]]
+
+            # Run Tavily searches
+            web_snippets = []
+            for q in queries:
+                web_snippets.append(f"QUERY: {q}\n{internet_search(q)}")
+
+            verifier_context = (
+                "PROPOSED IDEAS:\n" + ideas_text +
+                "\n\nWEB SEARCH RESULTS:\n" + "\n\n".join(web_snippets)
+            )
+
+            # Step 2: verifier output
+            final_text = run_agent_nonstream(
+                "Vet and revise these ideas based on the web results.",
+                intent="verify",
+                context=verifier_context
+            )
+
+            with st.chat_message("assistant"):
+                st.caption("Research Verifier")
+                st.markdown(final_text)
+
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": error_msg,
-                "agent": f"{agent_name}"
+                "content": final_text,
+                "agent": "Research Verifier"
             })
+
+            handled = True
+
+    
+        # Generate response
+        if not handled:
+            with st.chat_message("assistant"):
+                st.caption(f"{agent_name}")
+                
+                # Show source chunks in expander
+                if context:
+                    with st.expander("Source Chunks Used", expanded=False):
+                        chunks = context.split("\n\n---\n\n")
+                        for i, chunk in enumerate(chunks, 1):
+                            st.text_area(
+                                f"Chunk {i}",
+                                chunk[:500] + "..." if len(chunk) > 500 else chunk,
+                                height=100,
+                                disabled=True,
+                                label_visibility="collapsed"
+                            )
+                            if i < len(chunks):
+                                st.divider()
+                
+                # Stream response
+                try:
+                    stream = run_agent(question, intent, context)
+                    response = st.write_stream(stream)
+                    
+                    # Save to history
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "agent": f"{agent_name}"
+                    })
+                except Exception as e:
+                    error_msg = f"Error generating response: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": error_msg,
+                        "agent": f"{agent_name}"
+                    })

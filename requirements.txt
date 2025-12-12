@@ -22,3 +22,6 @@ streamlit>=1.30.0
 
 # Environment Configuration
 python-dotenv>=1.0.0
+
+# Internet Search Tool
+tavily-python>=0.3.3
